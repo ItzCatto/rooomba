@@ -156,7 +156,10 @@ class Handler(BaseHTTPRequestHandler):
         rate = clean(body.get("voiceSpeed"), "+0%", r"[+-]\d{1,3}%")
         pitch = clean(body.get("voicePitch"), "+0Hz", r"[+-]\d{1,3}Hz")
         audio = voice(re.sub(r"\[eye ?roll\]", "", reply, flags=re.I).strip(), voice_name, rate, pitch)
-        print(f"Robot: {reply}" + ("" if audio else "  (using the tablet's own voice)") + "\n")
+        if not reply:
+            print("Robot: (the AI gave an empty reply)\n")
+        else:
+            print(f"Robot: {reply}" + ("" if audio else "  (using the tablet's own voice)") + "\n")
         self.send_json(200, {"reply": reply, "audio": base64.b64encode(audio).decode() if audio else None})
 
     def log_message(self, *args):

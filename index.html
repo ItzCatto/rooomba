@@ -588,13 +588,18 @@
   // Small words under the eyes, so you can tell whether he's listening (turn off with statusText: false)
   const statusEl = document.getElementById('status');
   statusEl.style.color = CONFIG.eyeColor;
-  let statusTimer = null;
+  let statusTimer = null, statusHeld = false, idleText = '';
   function status(text, ms = 0) {
     if (!pick('statusText', true)) return;
     clearTimeout(statusTimer);
+    statusHeld = !!(text && ms);
     if (text) statusEl.textContent = text;
     statusEl.style.opacity = text ? 0.75 : 0;
-    if (text && ms) statusTimer = setTimeout(() => (statusEl.style.opacity = 0), ms);
+    if (statusHeld) statusTimer = setTimeout(() => status(idleText), ms);   // then back to e.g. "Listening…"
+  }
+  function idleStatus(text) {
+    idleText = text;
+    if (!statusHeld) status(text);
   }
 
   function startBrain() {
@@ -620,7 +625,7 @@
     } catch {}
 
     const listen = () => { if (awake && !busy) { try { rec.start(); } catch {} } };
-    rec.onstart = () => status('Listening…');
+    rec.onstart = () => idleStatus('Listening…');
     rec.onresult = (e) => {
       const text = e.results[0][0].transcript.trim();
       if (text) respond(text);
@@ -643,7 +648,7 @@
       busy = true;
       status(`“${text}”`);
       play('thinking');
-      let reply = '', audio = null;
+      let reply = '', audio = null, problem = '';
       try {
         const r = await fetch(`${BRAIN_URL}/api/chat`, {
           method: 'POST',
@@ -660,26 +665,32 @@
         });
         if (r.status === 401) {
           reply = "Who are you? Open me with the proper link.";
+          problem = 'Wrong passcode. Open the tablet link that server.py printed.';
+        } else if (!r.ok) {
+          reply = "Ugh. My brain is broken. Go look at the computer.";
+          problem = `The PC had a problem (error ${r.status}). Look at the server.py window.`;
         } else {
-          if (!r.ok) throw new Error(r.status);
           const data = await r.json();
           reply = data.reply || '';
           audio = data.audio;
+          if (!reply.replace(/\[eye ?roll\]/gi, '').trim()) problem = 'The AI gave an empty reply. Look at the server.py window.';
           history.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
           if (history.length > MEMORY * 2) history.splice(0, history.length - MEMORY * 2);
         }
       } catch {
         reply = "Ugh. My brain isn't answering. Is the computer even on?";
+        problem = "Can't reach the PC. Is server.py running?";
       }
       const roll = /\[eye ?roll\]/i.test(reply);
       reply = reply.replace(/\[eye ?roll\]/gi, '').replace(/\s+/g, ' ').trim();
+      status(problem || reply);                          // subtitles, or what went wrong
       let played = false;
       if (audio && audioCtx) {
         try { await playVoice(audio, roll); played = true; } catch (e) { console.warn('[RoboFace] Could not play the voice audio', e); }
       }
       if (!played) await say(reply, roll);
       play('unimpressed');
-      status('');
+      status(problem || reply, problem ? 8000 : 2500);
       busy = false;
       listen();
     }
@@ -736,7 +747,8 @@
         u.onend = u.onerror = finish;
         setTimeout(finish, 3000 + text.length * 90);  // safety net if the browser never reports the end
         speechSynthesis.cancel();
-        speechSynthesis.speak(u);
+        window._robotLine = u;                         // Chrome can drop an utterance nothing holds on to
+        setTimeout(() => speechSynthesis.speak(u), 60); // and right after cancel()
       });
     }
 
