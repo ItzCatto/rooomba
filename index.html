@@ -626,8 +626,9 @@
             history,
             prompt: PROMPT,
             model: pick('aiModel', ''),
-            voiceId: pick('voiceId', ''),
-            voiceModel: pick('voiceModel', ''),
+            voice: pick('voice', ''),
+            voiceSpeed: pick('voiceSpeed', ''),
+            voicePitch: pick('voicePitch', ''),
           }),
         });
         if (r.status === 401) {
@@ -647,7 +648,7 @@
       reply = reply.replace(/\[eye ?roll\]/gi, '').replace(/\s+/g, ' ').trim();
       let played = false;
       if (audio && audioCtx) {
-        try { await playVoice(audio, roll); played = true; } catch (e) { console.warn('[RoboFace] Could not play ElevenLabs audio', e); }
+        try { await playVoice(audio, roll); played = true; } catch (e) { console.warn('[RoboFace] Could not play the voice audio', e); }
       }
       if (!played) await say(reply, roll);
       play('unimpressed');
@@ -655,7 +656,7 @@
       listen();
     }
 
-    // Plays the ElevenLabs voice and moves the eyes with how loud it actually is, syllable by syllable
+    // Plays the PC's voice and moves the eyes with how loud it actually is, syllable by syllable
     async function playVoice(base64, roll) {
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
       const buffer = await new Promise((ok, fail) => audioCtx.decodeAudioData(bytes.buffer, ok, fail));
@@ -717,7 +718,7 @@
         awake = true;
         speechSynthesis.speak(new SpeechSynthesisUtterance(''));   // unlocks the backup voice on iPad
         const AC = window.AudioContext || window.webkitAudioContext;
-        if (AC) audioCtx = new AC();                                 // unlocks the ElevenLabs voice
+        if (AC) audioCtx = new AC();                                 // unlocks the PC's voice
       }
       if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
       listen();

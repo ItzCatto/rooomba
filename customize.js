@@ -3,8 +3,8 @@
 //  Edit this file on GitHub and commit. The site updates within a few minutes;
 //  then reload the page on the tablet. His personality is in prompt.txt.
 //
-//  This repo is public, so never put your ElevenLabs key or passcode here.
-//  Those stay in server.py on your PC.
+//  This repo is public, so never put your passcode here.
+//  It stays in passcode.txt on your PC.
 // ─────────────────────────────────────────────────────────────────────────────
 window.ROBOT_SETTINGS = {
 
@@ -33,10 +33,11 @@ window.ROBOT_SETTINGS = {
   motionBlur: 40,           // Motion blur length in milliseconds. 0 turns it off
 
   // ── Voice ──
-  voiceId: 'PjC87YIKtz6Y7JFMZ1hh',   // ElevenLabs voice ID (Brad - Australian)
-  voiceModel: 'eleven_flash_v2_5',    // eleven_flash_v2_5 = fastest, eleven_multilingual_v2 = best quality
+  voice: 'en-AU-WilliamNeural',      // Free Microsoft voice. Others: en-GB-RyanNeural, en-US-GuyNeural, en-US-ChristopherNeural, en-AU-NatashaNeural
+  voiceSpeed: '+5%',                  // Faster or slower, e.g. '-10%' or '+15%'
+  voicePitch: '-4Hz',                 // Deeper or higher, e.g. '-10Hz' or '+5Hz'
   listenLanguage: 'en-US',            // Language he listens for, e.g. 'en-AU' or 'en-GB'
-  backupVoiceRate: 1.05,              // The tablet's own voice, only used if ElevenLabs fails
+  backupVoiceRate: 1.05,              // The tablet's own voice, only used if the PC's voice fails
   backupVoicePitch: 0.85,
 
   // ── Preview ──
