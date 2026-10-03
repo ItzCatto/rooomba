@@ -36,10 +36,16 @@
     -webkit-tap-highlight-color: transparent;
   }
   canvas { display: block; width: 100%; height: 100%; }
+  #status {
+    position: fixed; left: 16px; right: 16px; bottom: 5vh;
+    text-align: center; font: 600 clamp(14px, 2.6vmin, 22px)/1.35 system-ui, sans-serif;
+    opacity: 0; transition: opacity 0.4s; pointer-events: none;
+  }
 </style>
 </head>
 <body>
 <canvas id="eyes"></canvas>
+<div id="status"></div>
 
 <script src="customize.js"></script>
 <script>
@@ -579,12 +585,25 @@
       .catch(() => {});
   }
 
+  // Small words under the eyes, so you can tell whether he's listening (turn off with statusText: false)
+  const statusEl = document.getElementById('status');
+  statusEl.style.color = CONFIG.eyeColor;
+  let statusTimer = null;
+  function status(text, ms = 0) {
+    if (!pick('statusText', true)) return;
+    clearTimeout(statusTimer);
+    if (text) statusEl.textContent = text;
+    statusEl.style.opacity = text ? 0.75 : 0;
+    if (text && ms) statusTimer = setTimeout(() => (statusEl.style.opacity = 0), ms);
+  }
+
   function startBrain() {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Recognition) {
-      console.warn('[RoboFace] This browser has no speech recognition. Use Chrome on Android or Safari on iPad.');
+      status("This browser can't hear. Open this page in Chrome.");
       return;
     }
+    status('Tap anywhere to wake me up');
     const rec = new Recognition();
     rec.lang = VOICE.lang;
     rec.interimResults = false;
@@ -601,6 +620,7 @@
     } catch {}
 
     const listen = () => { if (awake && !busy) { try { rec.start(); } catch {} } };
+    rec.onstart = () => status('Listening…');
     rec.onresult = (e) => {
       const text = e.results[0][0].transcript.trim();
       if (text) respond(text);
@@ -609,12 +629,19 @@
     rec.onerror = (e) => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         awake = false;
-        console.warn('[RoboFace] Microphone blocked. See the setup steps for your tablet.');
+        status('Microphone blocked. Tap the icon left of the address bar, allow the microphone, then reload.');
+      } else if (e.error === 'audio-capture') {
+        status("Can't find a microphone on this tablet.");
+      } else if (e.error === 'network') {
+        status("Can't reach the speech service. Is the tablet on Wi-Fi?");
+      } else if (e.error === 'language-not-supported') {
+        status(`This tablet can't listen in ${VOICE.lang}. Change listenLanguage in customize.js.`);
       }
     };
 
     async function respond(text) {
       busy = true;
+      status(`“${text}”`);
       play('thinking');
       let reply = '', audio = null;
       try {
@@ -652,6 +679,7 @@
       }
       if (!played) await say(reply, roll);
       play('unimpressed');
+      status('');
       busy = false;
       listen();
     }
@@ -716,6 +744,7 @@
     window.addEventListener('pointerdown', () => {
       if (!awake) {
         awake = true;
+        status('Starting the microphone…');
         speechSynthesis.speak(new SpeechSynthesisUtterance(''));   // unlocks the backup voice on iPad
         const AC = window.AudioContext || window.webkitAudioContext;
         if (AC) audioCtx = new AC();                                 // unlocks the PC's voice

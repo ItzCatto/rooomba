@@ -40,6 +40,9 @@ window.ROBOT_SETTINGS = {
   backupVoiceRate: 1.05,              // The tablet's own voice, only used if the PC's voice fails
   backupVoicePitch: 0.85,
 
+  // ── Screen text ──
+  statusText: true,         // Small words under the eyes ("Listening…", what he heard, mic problems). false hides them
+
   // ── Preview ──
   demo: true,               // Plays a demo loop while brainUrl is empty
 };
