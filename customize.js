@@ -37,9 +37,13 @@ window.ROBOT_SETTINGS = {
   voiceSpeed: '+5%',                  // Faster or slower, e.g. '-10%' or '+15%'
   voicePitch: '-4Hz',                 // Deeper or higher, e.g. '-10Hz' or '+5Hz'
   useTabletVoice: false,              // true = skip the PC's voice and use the tablet's own (if the mic stops working after he talks)
-  listenLanguage: 'en-US',            // Language he listens for, e.g. 'en-AU' or 'en-GB'
+  listenLanguage: 'en-US',            // Language you talk to him in
   backupVoiceRate: 1.05,              // The tablet's own voice, only used if the PC's voice fails
   backupVoicePitch: 0.85,
+
+  // ── Ears ──
+  micSensitivity: 1,        // Higher = hears quieter talking (try 2). Lower = ignores more background noise (try 0.5)
+  quietTime: 1,             // Seconds of quiet that mean you're done talking
 
   // ── Screen text ──
   statusText: true,         // Small words under the eyes ("Listening…", what he heard, mic problems). false hides them

@@ -630,18 +630,20 @@
   }
 
   function startBrain() {
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!Recognition) {
-      status("This browser can't hear. Open this page in Chrome.");
+    // The tablet records what you say, like a voice memo, and the PC turns it into words with Whisper.
+    // (Chrome's own speech listener on Android hears you once and then goes deaf, so it isn't used.)
+    const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+    log(`can record: ${canRecord ? 'yes' : 'NO'}`);
+    if (!canRecord) {
+      status("This browser can't record. Open this page in Chrome.");
       return;
     }
     status('Tap anywhere to wake me up');
-    log(`speech recognition: ${Recognition ? 'yes' : 'NO'}`);
-    const rec = new Recognition();
-    rec.lang = VOICE.lang;
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
-    let awake = false, busy = false, tapped = false, retry = 250, micStarted = 0;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const SENSITIVITY = Math.max(0.2, pick('micSensitivity', 1));
+    const QUIET_MS = Math.max(400, pick('quietTime', 1) * 1000);   // this much quiet means you're done talking
+    const RECORD_TYPE = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'].find((t) => MediaRecorder.isTypeSupported(t)) || '';
+    let awake = false, busy = false, tapped = false, mic = null, opening = false;
     const history = [];
 
     // Passcode: open the site once with ?key=YOURCODE and this tablet remembers it
@@ -652,51 +654,121 @@
       passcode = localStorage.getItem('robot-key') || '';
     } catch {}
 
-    const listen = () => { if (awake && !busy) { try { rec.start(); } catch {} } };
-    rec.onstart = () => { micStarted = performance.now(); idleStatus('Listening…'); };
-    rec.onresult = (e) => {
-      retry = 250;
-      const text = e.results[0][0].transcript.trim();
-      if (text) respond(text);
-    };
-    rec.onend = () => { micStarted = 0; setTimeout(listen, retry); };   // keep listening
-    rec.onspeechstart = () => { micStarted = performance.now(); retry = 250; };
-    // Some tablets leave the mic hanging without ever ending. Give it a kick.
-    setInterval(() => {
-      if (micStarted && performance.now() - micStarted > 15000) { log('mic stuck, restarting'); micStarted = 0; rec.abort(); }
-    }, 2000);
-    for (const ev of ['start', 'audiostart', 'speechstart', 'speechend', 'nomatch', 'end']) {
-      rec.addEventListener(ev, () => log(`mic: ${ev}`));
-    }
-    rec.addEventListener('result', (e) => log(`mic heard: "${e.results[0][0].transcript}"`));
-    rec.addEventListener('error', (e) => log(`mic error: ${e.error}`));
-    rec.onerror = (e) => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        awake = false;
-        status('Microphone blocked. Tap the icon left of the address bar, allow the microphone, then reload.');
-      } else if (e.error === 'audio-capture') {
-        // Usually the speaker still holding the audio after he talked. Wait a little longer each time.
-        retry = Math.min(retry * 2, 4000);
-        status(retry < 4000 ? 'Mic is busy, trying again…' : "Can't get the microphone. Close other apps that use it.");
-      } else if (e.error === 'network') {
-        status("Can't reach the speech service. Is the tablet on Wi-Fi?");
-      } else if (e.error === 'language-not-supported') {
-        status(`This tablet can't listen in ${VOICE.lang}. Change listenLanguage in customize.js.`);
+    async function listen() {
+      if (!awake || busy || mic || opening) return;
+      opening = true;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        if (!awake || busy) stream.getTracks().forEach((t) => t.stop());
+        else mic = openMic(stream);
+      } catch (e) {
+        log(`mic error: ${e.name} ${e.message}`);
+        if (e.name === 'NotAllowedError' || e.name === 'SecurityError') {
+          awake = false;
+          status('Microphone blocked. Tap the icon left of the address bar, allow the microphone, then reload.');
+        } else if (e.name === 'NotFoundError') {
+          status("Can't find a microphone on this tablet.");
+        } else {
+          status('Mic is busy, trying again…');
+          setTimeout(listen, 2000);
+        }
+      } finally {
+        opening = false;
       }
-    };
+    }
 
-    async function respond(text) {
+    // Watches how loud the mic is. Loud for a moment = you started talking. Quiet for a second = you're done.
+    function openMic(stream) {
+      const ctx = new AC();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      const wave = new Float32Array(analyser.fftSize);
+      let recorder = null, chunks = [], talking = false, loudMs = 0, quietMs = 0, talkStart = 0, since = 0, floor = -1;
+
+      const record = () => {
+        chunks = [];
+        recorder = new MediaRecorder(stream, { audioBitsPerSecond: 32000, ...(RECORD_TYPE && { mimeType: RECORD_TYPE }) });
+        recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+        recorder.start();
+        since = performance.now();
+      };
+      const close = () => {
+        clearInterval(timer);
+        stream.getTracks().forEach((t) => t.stop());
+        ctx.close().catch(() => {});
+        mic = null;
+      };
+      const done = () => {
+        busy = true;
+        const r = recorder;
+        r.onstop = () => {
+          close();
+          respond({ recording: new Blob(chunks, { type: r.mimeType || RECORD_TYPE || 'audio/webm' }) });
+        };
+        r.stop();
+      };
+
+      record();
+      idleStatus('Listening…');
+      log('mic: listening');
+      const timer = setInterval(() => {
+        analyser.getFloatTimeDomainData(wave);
+        let sum = 0;
+        for (let i = 0; i < wave.length; i++) sum += wave[i] * wave[i];
+        const level = Math.sqrt(sum / wave.length);
+        if (floor < 0) floor = level;
+        const threshold = Math.max(0.012, floor * 3) / SENSITIVITY;
+        const loud = level > threshold;
+        if (!talking) {
+          if (!loud) floor += (level - floor) * 0.05;          // learn how loud the room is
+          loudMs = loud ? loudMs + 50 : 0;
+          if (loudMs >= 150) {
+            talking = true;
+            quietMs = 0;
+            talkStart = performance.now();
+            idleStatus('Hearing you…');
+            log('mic: you started talking');
+          } else if (performance.now() - since > 6000) {
+            recorder.onstop = null;                             // nothing said: throw it away and start fresh
+            recorder.stop();
+            record();
+          }
+        } else {
+          quietMs = loud ? 0 : quietMs + 50;
+          if (quietMs >= QUIET_MS || performance.now() - talkStart > 20000) {
+            log('mic: you stopped talking');
+            done();
+          }
+        }
+      }, 50);
+      return { close };
+    }
+
+    const toBase64 = (blob) => new Promise((ok, fail) => {
+      const reader = new FileReader();
+      reader.onload = () => ok(String(reader.result).split(',')[1] || '');
+      reader.onerror = fail;
+      reader.readAsDataURL(blob);
+    });
+
+    async function respond({ text = '', recording = null }) {
       busy = true;
-      status(`“${text}”`);
+      status(text ? `“${text}”` : '…');
       play('thinking');
       let reply = '', audio = null, problem = '';
       try {
-        log(`sending to PC (passcode ${passcode ? passcode.slice(0, 3) + '…' : 'MISSING'})`);
+        log(`sending to PC (passcode ${passcode ? passcode.slice(0, 3) + '…' : 'MISSING'}${recording ? `, ${Math.round(recording.size / 1024)} KB of recording` : ''})`);
         const r = await fetch(`${BRAIN_URL}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-robot-key': passcode },
           body: JSON.stringify({
             text,
+            recording: recording ? await toBase64(recording) : undefined,
+            recordingType: recording ? recording.type : undefined,
+            language: VOICE.lang,
             history,
             prompt: PROMPT,
             model: pick('aiModel', ''),
@@ -714,6 +786,17 @@
           problem = `The PC had a problem (error ${r.status}). Look at the server.py window.`;
         } else {
           const data = await r.json();
+          if (recording) {
+            text = data.heard || '';
+            log(`PC heard: "${text}"`);
+            if (!text) {                                   // just noise: go back to listening without a word
+              play('unimpressed');
+              status('');
+              busy = false;
+              listen();
+              return;
+            }
+          }
           reply = data.reply || '';
           audio = data.audio;
           log(`reply: "${reply}" / audio: ${audio ? Math.round(audio.length / 1365) + ' KB' : 'none'}`);
@@ -736,13 +819,12 @@
       if (!played) { log(`using tablet voice${tapped ? '' : ' (screen not tapped yet)'}`); await say(reply, roll); }
       play('unimpressed');
       status(problem || reply, problem ? 8000 : 2500);
-      await new Promise((ok) => setTimeout(ok, played ? 1000 : 300));   // let the tablet hand the audio back to the mic
+      await new Promise((ok) => setTimeout(ok, 300));   // so the mic doesn't catch the tail of his voice
       busy = false;
       listen();
     }
 
-    // Plays the PC's voice and moves the eyes with how loud it actually is, syllable by syllable.
-    // It plays through a plain <audio> player: on Android, Web Audio playback leaves the mic deaf afterwards.
+    // Plays the PC's voice and moves the eyes with how loud it actually is, syllable by syllable
     async function playVoice(base64, roll) {
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
       const env = await loudness(bytes.buffer.slice(0)).catch(() => null);
@@ -777,7 +859,7 @@
       }
     }
 
-    // How loud the voice is every 20 ms, worked out ahead of time without touching the speakers
+    // How loud the voice is every 20 ms, worked out ahead of time
     async function loudness(data) {
       const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
       const ctx = new OAC(1, 44100, 44100);
@@ -818,7 +900,6 @@
       });
     }
 
-    // First tap wakes him up. Any later tap also nudges the mic back on if the tablet stopped it.
     if (DEBUG) {
       const form = document.querySelector('#debug form');
       form.addEventListener('submit', (e) => {
@@ -826,10 +907,15 @@
         const text = form.firstChild.value.trim();
         form.firstChild.value = '';
         tapped = true;
-        if (text && !busy) { log(`typed: "${text}"`); respond(text); }
+        if (text && !busy) {
+          log(`typed: "${text}"`);
+          if (mic) mic.close();
+          respond({ text });
+        }
       });
     }
 
+    // First tap wakes him up. Any later tap also nudges the mic back on if the tablet stopped it.
     window.addEventListener('pointerdown', () => {
       if (!awake) {
         awake = true;
@@ -837,7 +923,6 @@
         speechSynthesis.speak(new SpeechSynthesisUtterance(''));   // unlocks the backup voice on iPad
         tapped = true;                                               // after a tap, the browser lets the PC's voice play
       }
-      retry = 250;
       listen();
     });
   }

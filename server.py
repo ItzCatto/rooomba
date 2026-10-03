@@ -2,10 +2,11 @@
 """
 Robot brain (runs on your PC)
 -----------------------------
-The face lives on GitHub Pages. This takes what you say, gets a reply from Ollama
-on this PC, turns it into a voice with the free Microsoft Edge voices, and sends it back.
+The face lives on GitHub Pages. The tablet records what you say and sends it here.
+This turns it into words with Whisper, gets a reply from Ollama on this PC, turns
+that into a voice with the free Microsoft Edge voices, and sends it back.
 
-  1. Once:  pip install --user --break-system-packages edge-tts
+  1. Once:  pip install --user --break-system-packages edge-tts faster-whisper
   2. Run:   python3 server.py
   3. Once, in another window:  sudo tailscale funnel --bg 8000
 
@@ -15,6 +16,7 @@ time you run this, and it never goes on GitHub.
 
 import asyncio
 import base64
+import io
 import json
 import re
 import secrets
@@ -29,6 +31,11 @@ try:
 except ImportError:
     edge_tts = None
 
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
 # ─────────────────────────────── Settings ───────────────────────────────
 PORT = 8000
 OLLAMA_URL = "http://localhost:11434"
@@ -36,6 +43,7 @@ DEFAULT_MODEL = ""                         # Used when customize.js leaves aiMod
 SITE_URL = "https://itzcatto.github.io/rooomba/"
 
 DEFAULT_VOICE = "en-AU-WilliamNeural"      # Australian guy (customize.js can override)
+WHISPER_MODEL = "base.en"                  # Ears. "small.en" hears better but is slower. Use "base" for other languages
 DEFAULT_PERSONA = "You are the sarcastic, rude AI inside a robot vacuum. Reply in one to three short sentences."
 
 PASSCODE_FILE = Path(__file__).with_name("passcode.txt")
@@ -67,6 +75,30 @@ def think(messages, model):
         result = ollama("/api/chat", {**payload, "model": DEFAULT_MODEL})
     reply = result["message"]["content"]
     return re.sub(r"<think>.*?</think>", "", reply, flags=re.S).strip()   # some models think out loud first
+
+
+ears = None
+ears_lock = threading.RLock()   # hear() holds it while load_ears() takes it again
+
+
+def load_ears():
+    global ears
+    with ears_lock:
+        if ears is None:
+            print(f"Loading the ears ({WHISPER_MODEL}). The first time, this downloads about 150 MB...")
+            ears = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            print("Ears ready.\n")
+    return ears
+
+
+def hear(recording, language):
+    """Turn the tablet's recording into words."""
+    language = "en" if WHISPER_MODEL.endswith(".en") else (language[:2].lower() or None)
+    with ears_lock:
+        segments, _ = load_ears().transcribe(io.BytesIO(recording), language=language, beam_size=1, vad_filter=True)
+        # Skip bits Whisper itself thinks were just noise (it likes to "hear" things like "Thank you." in silence)
+        words = [s.text.strip() for s in segments if not (s.no_speech_prob > 0.6 and s.avg_logprob < -0.8)]
+    return " ".join(words).strip()
 
 
 def voice(text, voice_name, rate, pitch):
@@ -131,10 +163,26 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(401, {"error": "wrong passcode"})
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length > 10_000_000:
+                return self.send_json(413, {"error": "too big"})
             body = json.loads(self.rfile.read(length) or b"{}")
             text = str(body.get("text", "")).strip()[:1000]
-        except (ValueError, AttributeError):
+            recording = base64.b64decode(body.get("recording") or "")
+        except (ValueError, AttributeError, TypeError):
             return self.send_json(400, {"error": "bad request"})
+
+        if recording:
+            if not WhisperModel:
+                print("The tablet sent a recording, but the ears aren't installed. Run:")
+                print("  pip install --user --break-system-packages faster-whisper\n")
+                return self.send_json(503, {"error": "ears not installed"})
+            try:
+                text = hear(recording, str(body.get("language") or "en"))[:1000]
+            except Exception as e:
+                print(f"Couldn't understand the recording: {e}\n")
+                return self.send_json(500, {"error": str(e)})
+            if not text:
+                return self.send_json(200, {"heard": "", "reply": "", "audio": None})
         if not text:
             return self.send_json(400, {"error": "no text"})
 
@@ -161,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
             print("Robot: (the AI gave an empty reply)\n")
         else:
             print(f"Robot: {reply}" + ("" if audio else "  (using the tablet's own voice)") + "\n")
-        self.send_json(200, {"reply": reply, "audio": base64.b64encode(audio).decode() if audio else None})
+        self.send_json(200, {"heard": text, "reply": reply, "audio": base64.b64encode(audio).decode() if audio else None})
 
     def log_message(self, *args):
         pass   # keep the console tidy
@@ -187,9 +235,11 @@ if __name__ == "__main__":
     PASSCODE = load_passcode()
 
     print(f"Brain running on port {PORT}, using {DEFAULT_MODEL}.")
-    if not edge_tts:
-        print("The voice isn't installed, so the tablet will use its own. To fix it, run:")
-        print("  pip install --user --break-system-packages edge-tts\n")
+    if not edge_tts or not WhisperModel:
+        print("Some parts aren't installed yet. To fix it, run:")
+        print("  pip install --user --break-system-packages edge-tts faster-whisper\n")
     print(f"Tablet link (open it once):  {SITE_URL}?key={PASSCODE}\n")
     threading.Thread(target=warm_up, daemon=True).start()
+    if WhisperModel:
+        threading.Thread(target=load_ears, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
