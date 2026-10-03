@@ -127,6 +127,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] != "/api/chat":
             return self.send_json(404, {"error": "not found"})
         if PASSCODE and self.headers.get("x-robot-key", "") != PASSCODE:
+            print("The tablet knocked but used the wrong passcode. Open the tablet link printed above.\n")
             return self.send_json(401, {"error": "wrong passcode"})
         try:
             length = int(self.headers.get("Content-Length", 0))
