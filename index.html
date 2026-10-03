@@ -641,7 +641,8 @@
     rec.lang = VOICE.lang;
     rec.interimResults = false;
     rec.maxAlternatives = 1;
-    let awake = false, busy = false, audioCtx = null;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let awake = false, busy = false, tapped = false, retry = 250, micStarted = 0;
     const history = [];
 
     // Passcode: open the site once with ?key=YOURCODE and this tablet remembers it
@@ -653,12 +654,18 @@
     } catch {}
 
     const listen = () => { if (awake && !busy) { try { rec.start(); } catch {} } };
-    rec.onstart = () => idleStatus('Listening…');
+    rec.onstart = () => { micStarted = performance.now(); idleStatus('Listening…'); };
     rec.onresult = (e) => {
+      retry = 250;
       const text = e.results[0][0].transcript.trim();
       if (text) respond(text);
     };
-    rec.onend = () => setTimeout(listen, 250);       // keep listening
+    rec.onend = () => { micStarted = 0; setTimeout(listen, retry); };   // keep listening
+    rec.onspeechstart = () => { micStarted = performance.now(); retry = 250; };
+    // Some tablets leave the mic hanging without ever ending. Give it a kick.
+    setInterval(() => {
+      if (micStarted && performance.now() - micStarted > 15000) { log('mic stuck, restarting'); micStarted = 0; rec.abort(); }
+    }, 2000);
     for (const ev of ['start', 'audiostart', 'speechstart', 'speechend', 'nomatch', 'end']) {
       rec.addEventListener(ev, () => log(`mic: ${ev}`));
     }
@@ -669,7 +676,9 @@
         awake = false;
         status('Microphone blocked. Tap the icon left of the address bar, allow the microphone, then reload.');
       } else if (e.error === 'audio-capture') {
-        status("Can't find a microphone on this tablet.");
+        // Usually the speaker still holding the audio after he talked. Wait a little longer each time.
+        retry = Math.min(retry * 2, 4000);
+        status(retry < 4000 ? 'Mic is busy, trying again…' : "Can't get the microphone. Close other apps that use it.");
       } else if (e.error === 'network') {
         status("Can't reach the speech service. Is the tablet on Wi-Fi?");
       } else if (e.error === 'language-not-supported') {
@@ -722,18 +731,29 @@
       reply = reply.replace(/\[eye ?roll\]/gi, '').replace(/\s+/g, ' ').trim();
       status(problem || reply);                          // subtitles, or what went wrong
       let played = false;
-      if (audio && audioCtx) {
+      if (audio && tapped && AC) {
         try { await playVoice(audio, roll); played = true; log('played PC voice'); } catch (e) { log(`PC voice failed: ${e.message || e}`); }
       }
-      if (!played) { log(`using tablet voice${audioCtx ? '' : ' (screen not tapped yet)'}`); await say(reply, roll); }
+      if (!played) { log(`using tablet voice${tapped ? '' : ' (screen not tapped yet)'}`); await say(reply, roll); }
       play('unimpressed');
       status(problem || reply, problem ? 8000 : 2500);
+      await new Promise((ok) => setTimeout(ok, 400));   // let the tablet hand the audio back to the mic
       busy = false;
       listen();
     }
 
     // Plays the PC's voice and moves the eyes with how loud it actually is, syllable by syllable
+    // A fresh audio context per reply, closed right after: on Android an open one keeps the mic from starting
     async function playVoice(base64, roll) {
+      const audioCtx = new AC();
+      try {
+        await playOn(audioCtx, base64, roll);
+      } finally {
+        audioCtx.close().catch(() => {});
+      }
+    }
+
+    async function playOn(audioCtx, base64, roll) {
       const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
       const buffer = await new Promise((ok, fail) => audioCtx.decodeAudioData(bytes.buffer, ok, fail));
       if (audioCtx.state === 'suspended') await audioCtx.resume();
@@ -796,6 +816,7 @@
         e.preventDefault();
         const text = form.firstChild.value.trim();
         form.firstChild.value = '';
+        tapped = true;
         if (text && !busy) { log(`typed: "${text}"`); respond(text); }
       });
     }
@@ -805,10 +826,9 @@
         awake = true;
         status('Starting the microphone…');
         speechSynthesis.speak(new SpeechSynthesisUtterance(''));   // unlocks the backup voice on iPad
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (AC) audioCtx = new AC();                                 // unlocks the PC's voice
+        tapped = true;                                               // after a tap, the browser lets the PC's voice play
       }
-      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+      retry = 250;
       listen();
     });
   }
