@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Robot Eyes</title>
+<!--
+  ROBOT EYES — orange on white.
+  Colors, eye shape, attitude, voice and more are in customize.js. His personality is in prompt.txt.
+
+    RoboFace.play('unimpressed')   // resting face (default). Heavy lids, lazy blinks, side-eye. Also stops speaking.
+    RoboFace.play('thinking')      // judgmental stare while the AI writes its reply, so the wait looks like attitude, not loading
+    RoboFace.play('speaking')      // bounces up and down until you play 'unimpressed'
+    RoboFace.play('eyeRoll')       // rolls its eyes once (works while speaking or thinking too)
+
+    RoboFace.voice(0.7)            // optional: drive the speaking bounce from real audio volume (0 to 1)
+
+  Typical hookup:
+    RoboFace.play('thinking');      // as soon as you send the message to the AI
+    const reply = await askAI(text);
+    RoboFace.play('speaking');      // when the voice starts
+    await speak(reply);
+    RoboFace.play('unimpressed');   // when the voice ends
+
+  Also works as a message from another script:  window.postMessage('speaking')
+-->
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #EFF1EE;
+    cursor: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="eyes"></canvas>
+
+<script src="customize.js"></script>
+<script>
+(() => {
+  'use strict';
+
+  // ─────────────────────────────── Settings ───────────────────────────────
+  // Everything you'd want to change lives in customize.js. These are the fallbacks if it's missing.
+  const SET = window.ROBOT_SETTINGS || {};
+  const pick = (key, fallback) => (SET[key] !== undefined && SET[key] !== null ? SET[key] : fallback);
+  const range = (key, fallback) => {
+    const v = pick(key, fallback);
+    return Array.isArray(v) && v.length === 2 ? [Number(v[0]) * 1000, Number(v[1]) * 1000] : [fallback[0] * 1000, fallback[1] * 1000];
+  };
+
+  const CONFIG = {
+    demo: pick('demo', true),
+    eyeColor: pick('eyeColor', '#FF6B21'),
+    background: pick('background', '#EFF1EE'),
+    size: pick('size', 0.9),
+    motionBlur: pick('motionBlur', 40),
+  };
+
+  // Units: 100 = shorter side of the screen × size. (0, 0) is the center.
+  const EYE = { x: pick('eyeSpacing', 20), w: pick('eyeWidth', 22), h: pick('eyeHeight', 26), lookX: 7, lookY: 5, line: 2.8 };
+  EYE.r = Math.min(1, Math.max(0, pick('eyeRoundness', 1))) * Math.min(EYE.w, EYE.h) / 2;
+  const SOFT = 1.3;                              // how soft the corners are where the lid cuts across
+  const HOP = pick('speakingBounce', 2.6);       // how high the eyes rise when speaking
+  const BLINK_EVERY = range('blinkEvery', [3.5, 7]);
+  const SIDE_EYE_EVERY = range('sideEyeEvery', [4, 9]);
+  const MEMORY = Math.max(1, Math.round(pick('memory', 10)));
+
+  // Resting look: flat heavy lids, right one a little lower and tilted, like a raised eyebrow of disapproval
+  const LIDS = Math.min(0.8, Math.max(0, pick('lidHeaviness', 0.5)));
+  const REST = { gx: 0, gy: 0.1, lidL: Math.max(0, LIDS - 0.035), lidR: Math.min(0.85, LIDS + 0.035), tiltL: 0, tiltR: pick('browTilt', 4), sy: 1 };
+  const FACE_KEYS = Object.keys(REST);
+
+  // ──────────────────────────────── Helpers ───────────────────────────────
+  const DEG = Math.PI / 180;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const mix = (a, b, t) => a + (b - a) * t;
+  const ease = (rate, dt) => 1 - Math.exp(-rate * dt);
+  const easeInQuad = (x) => x * x;
+  const easeOutCubic = (x) => 1 - Math.pow(1 - x, 3);
+
+  // Springs: every movement starts, stops and settles naturally
+  const spring = (value, k, z) => ({ value, target: value, vel: 0, k, z });
+  function stepSpring(s, dt) {
+    s.vel += (s.k * (s.target - s.value) - 2 * s.z * Math.sqrt(s.k) * s.vel) * dt;
+    s.value += s.vel * dt;
+  }
+
+  // Smooth curve through timed keyframes (no corners at the keyframes, eases in and out at the ends)
+  function sampleKeys(keys, t, prop) {
+    const n = keys.length;
+    if (t <= keys[0][0]) return keys[0][1][prop];
+    if (t >= keys[n - 1][0]) return keys[n - 1][1][prop];
+    let i = 0;
+    while (t > keys[i + 1][0]) i++;
+    const slope = (j) => (j === 0 || j === n - 1 ? 0 : (keys[j + 1][1][prop] - keys[j - 1][1][prop]) / (keys[j + 1][0] - keys[j - 1][0]));
+    const h = keys[i + 1][0] - keys[i][0];
+    const u = (t - keys[i][0]) / h, u2 = u * u, u3 = u2 * u;
+    return (2 * u3 - 3 * u2 + 1) * keys[i][1][prop] + (u3 - 2 * u2 + u) * slope(i) * h
+         + (-2 * u3 + 3 * u2) * keys[i + 1][1][prop] + (u3 - u2) * slope(i + 1) * h;
+  }
+
+  // ───────────────────────────────── State ────────────────────────────────
+  const S = {
+    gx:    spring(REST.gx, 240, 0.8),
+    gy:    spring(REST.gy, 240, 0.8),
+    lidL:  spring(REST.lidL, 140, 1),
+    lidR:  spring(REST.lidR, 140, 1),
+    tiltL: spring(REST.tiltL, 140, 1),
+    tiltR: spring(REST.tiltR, 140, 1),
+    sy:    spring(REST.sy, 200, 0.9),
+    talk:  spring(0, 900, 1),          // vertical speaking motion
+  };
+
+  let roll = null;
+  let talkMix = 1;
+  let stretch = 1;
+  const side = { active: false, dir: 1, until: 0 };
+  const micro = { x: 0, y: 0, next: 0 };
+  const speech = { on: false, seg: null, words: 0, syllables: 0, stressed: false, lift: 0, ext: 0, extAt: -1e9 };
+  const thinking = { on: false, start: 0, nextBlink: 0, nextGlance: 0, glanceUntil: 0, dir: 1 };
+  let calm = 1;                       // 1 = normal breathing, lower = eerily still
+  const blinks = [];
+  let nextBlink = performance.now() + 2500;
+  let nextSideEye = performance.now() + 3000;
+
+  // ──────────────────────────────── Blinking ──────────────────────────────
+  const LAZY = { close: 150, hold: 110, open: 280 };
+  const UGH = { close: 210, hold: 230, open: 400 };
+  const STARE = { close: 240, hold: 170, open: 400 };   // slow, deliberate blink while staring someone down
+
+  function addBlink(type = LAZY, delay = 0) { blinks.push({ start: performance.now() + delay, ...type }); }
+
+  // How closed the eyes are at a given moment (0 open, 1 shut)
+  function blinkAt(time) {
+    let v = 0;
+    for (const b of blinks) {
+      const t = time - b.start;
+      if (t < 0 || t > b.close + b.hold + b.open) continue;
+      let a;
+      if (t < b.close) a = easeInQuad(t / b.close);
+      else if (t < b.close + b.hold) a = 1;
+      else a = 1 - easeOutCubic((t - b.close - b.hold) / b.open);
+      v = Math.max(v, a);
+    }
+    return v;
+  }
+
+  function finishBlinks(now) {
+    for (let i = blinks.length - 1; i >= 0; i--) {
+      const b = blinks[i];
+      // Keep finished blinks around briefly so the motion blur can still look back at them
+      if (now - b.start > b.close + b.hold + b.open + 100) {
+        if (!roll) { S.lidL.vel -= 1; S.lidR.vel -= 1; }   // tiny lift of the lids as the eye settles
+        blinks.splice(i, 1);
+      }
+    }
+  }
+
+  // ──────────────────────────────── Speaking ──────────────────────────────
+  // Syllables grouped into words, short gaps between words, longer pauses between phrases.
+  // The eyes float up while a word is being said and ripple gently on each syllable.
+  function syllableCount() {
+    const r = Math.random();
+    return r < 0.45 ? 1 : r < 0.8 ? 2 : r < 0.95 ? 3 : 4;
+  }
+
+  function startPhrase() {
+    speech.words = Math.round(rand(3, 7));
+    speech.syllables = syllableCount();
+    speech.stressed = true;
+  }
+
+  function nextSegment(start) {
+    if (speech.syllables > 0) {
+      speech.syllables--;
+      const amp = speech.stressed ? rand(0.7, 1) : rand(0.35, 0.7);
+      speech.stressed = false;
+      return { start, dur: rand(130, 220), amp, voiced: true };
+    }
+    if (speech.words > 1) {
+      speech.words--;
+      speech.syllables = syllableCount();
+      speech.stressed = true;
+      return { start, dur: rand(60, 140), amp: 0, voiced: false };
+    }
+    startPhrase();
+    return { start, dur: rand(260, 520), amp: 0, voiced: false };
+  }
+
+  function speechTarget(now, dt) {
+    if (!speech.seg) speech.seg = nextSegment(now);
+    let guard = 0;
+    while (now >= speech.seg.start + speech.seg.dur && guard++ < 20) speech.seg = nextSegment(speech.seg.start + speech.seg.dur);
+    const seg = speech.seg;
+    speech.lift += ((seg.voiced ? 1 : 0) - speech.lift) * ease(18, dt);
+    const u = clamp((now - seg.start) / seg.dur, 0, 1);
+    return -HOP * (0.3 * speech.lift + 0.7 * seg.amp * Math.pow(Math.sin(Math.PI * u), 2));
+  }
+
+  // ──────────────────────────────── Eye roll ──────────────────────────────
+  // Dip down-left, sweep up and over the top, hang there, then drop back heavy with a slow "ugh" blink.
+  function buildRoll(now) {
+    const current = {};
+    for (const k of FACE_KEYS) current[k] = S[k].value;
+    const open = (lidL, lidR, sy) => ({ lidL, lidR, tiltL: 0, tiltR: 0, sy });
+    return {
+      start: now,
+      blinked: false,
+      keys: [
+        [0,    current],
+        [170,  { ...REST, gx: -0.35, gy: 0.42, lidL: REST.lidL + 0.06, lidR: REST.lidR + 0.06 }],
+        [400,  { gx: -0.88, gy: -0.25, ...open(0.22, 0.24, 0.97) }],
+        [600,  { gx: -0.15, gy: -1.25, ...open(0.08, 0.1, 0.88) }],
+        [800,  { gx: 0.6,   gy: -1.05, ...open(0.1, 0.12, 0.9) }],
+        [1120, { gx: 0.52,  gy: -0.92, ...open(0.15, 0.17, 0.92) }],
+        [1420, { ...REST, gy: 0.28, lidL: REST.lidL + 0.12, lidR: REST.lidR + 0.12 }],
+        [1850, { ...REST }],
+      ],
+    };
+  }
+
+  // ───────────────────────────────── Canvas ───────────────────────────────
+  const canvas = document.getElementById('eyes');
+  const ctx = canvas.getContext('2d');
+  const blurLayer = document.createElement('canvas');   // motion blur samples are averaged here
+  const bctx = blurLayer.getContext('2d');
+  let W = 0, H = 0, DPR = 1, U = 1;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 3);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    for (const c of [canvas, blurLayer]) {
+      c.width = Math.round(W * DPR);
+      c.height = Math.round(H * DPR);
+    }
+    U = (Math.min(W, H) / 100) * CONFIG.size;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  document.documentElement.style.background = document.body.style.background = CONFIG.background;
+
+  // Outline of a rounded rectangle as points, clockwise from the top right
+  function roundedRectPoints(cx, cy, w, h, r) {
+    const pts = [];
+    const hw = w / 2 - r, hh = h / 2 - r;
+    const corners = [[cx + hw, cy - hh, -90], [cx + hw, cy + hh, 0], [cx - hw, cy + hh, 90], [cx - hw, cy - hh, 180]];
+    for (const [ox, oy, a0] of corners) {
+      for (let i = 0; i <= 12; i++) {
+        const a = (a0 + i * 7.5) * DEG;
+        pts.push([ox + Math.cos(a) * r, oy + Math.sin(a) * r]);
+      }
+    }
+    return pts;
+  }
+
+  // Keep only the part of the outline below a line (the top lid)
+  function clipBelow(pts, lineY) {
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[(i + 1) % pts.length];
+      const da = a[1] - lineY(a[0]), db = b[1] - lineY(b[0]);
+      if (da >= 0) out.push(a);
+      if ((da >= 0) !== (db >= 0)) {
+        const t = da / (da - db);
+        out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+      }
+    }
+    return out;
+  }
+
+  // Grow a convex outline outward by `rad` with rounded corners, as one clean path
+  function traceRounded(g, pts, rad) {
+    const P = [];
+    for (const p of pts) {
+      const q = P[P.length - 1];
+      if (!q || Math.abs(p[0] - q[0]) + Math.abs(p[1] - q[1]) > 1e-4) P.push(p);
+    }
+    while (P.length > 1 && Math.abs(P[0][0] - P[P.length - 1][0]) + Math.abs(P[0][1] - P[P.length - 1][1]) <= 1e-4) P.pop();
+    const n = P.length;
+    if (n < 3) return;
+    for (let i = 0; i < n; i++) {
+      const a = P[(i - 1 + n) % n], b = P[i], c = P[(i + 1) % n];
+      const angleIn = Math.atan2(a[0] - b[0], b[1] - a[1]);
+      let turn = Math.atan2(b[0] - c[0], c[1] - b[1]) - angleIn;
+      turn = Math.atan2(Math.sin(turn), Math.cos(turn));
+      if (turn < 0) turn = 0;
+      if (i === 0) g.moveTo(b[0] + Math.cos(angleIn) * rad, b[1] + Math.sin(angleIn) * rad);
+      g.arc(b[0], b[1], rad, angleIn, angleIn + turn);
+    }
+    g.closePath();
+  }
+
+  function eyePath(g, dir, p) {
+    const s = dir < 0 ? 'L' : 'R';
+    const grow = 1 + dir * p.gx * 0.05;                     // the eye it looks toward gets a touch bigger
+    const w = (EYE.w * grow) / Math.sqrt(p.stretch);
+    const h = EYE.h * grow * p.sy * p.stretch;
+    const r = Math.min(EYE.r * grow, w / 2, h / 2);
+    const cx = dir * EYE.x + p.gx * EYE.lookX;
+    const cy = p.gy * EYE.lookY + p.y;
+
+    // Shape shrunk by SOFT, cut by the lid, then grown back out with rounded corners.
+    // The eye's own curves stay exact and only the corners the lid makes get softened.
+    let pts = roundedRectPoints(cx, cy, w - 2 * SOFT, h - 2 * SOFT, Math.max(0, r - SOFT));
+    const lid = clamp(p['lid' + s], 0, 0.85);
+    const tilt = p['tilt' + s] * DEG;                      // positive = inner side lower
+    const slope = -dir * Math.tan(tilt);
+    const edge = cy - h / 2 + lid * h + SOFT / Math.cos(tilt);
+    pts = clipBelow(pts, (x) => edge + slope * (x - cx));
+    if (pts.length < 3) return;
+
+    // Blink: squash what's visible into a thin line, closing mostly from the top
+    if (p.blink > 0) {
+      let top = Infinity, bottom = -Infinity;
+      for (const q of pts) { top = Math.min(top, q[1]); bottom = Math.max(bottom, q[1]); }
+      const anchor = mix(top, bottom, 0.7);
+      const k = mix(1, Math.min(1, Math.max(0.01, EYE.line - 2 * SOFT) / Math.max(bottom - top, 0.01)), p.blink);
+      for (const q of pts) q[1] = anchor + (q[1] - anchor) * k;
+    }
+
+    traceRounded(g, pts, SOFT);
+  }
+
+  // Where everything is `ago` seconds before now, worked back from current velocities
+  function poseAgo(now, ago) {
+    const p = {};
+    for (const k of FACE_KEYS) p[k] = S[k].value - S[k].vel * ago;
+    const t = now - ago * 1000;
+    p.y = Math.sin((t / 1000) * 1.6) * 0.35 * calm + (S.talk.value - S.talk.vel * ago) * talkMix;
+    p.blink = blinkAt(t);
+    p.stretch = stretch;
+    return p;
+  }
+
+  function drawEyes(g, p) {
+    g.beginPath();
+    eyePath(g, -1, p);
+    eyePath(g, 1, p);
+    g.fill();
+  }
+
+  // ──────────────────────────────── Main loop ─────────────────────────────
+  let last = performance.now();
+
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 1 / 20);
+    last = now;
+    if (dt <= 0) { requestAnimationFrame(frame); return; }
+
+    // Speaking: straight up and down only
+    const external = now - speech.extAt < 250;
+    const speaking = speech.on || external;
+    if (external) S.talk.target = -speech.ext * HOP;
+    else if (speech.on) S.talk.target = speechTarget(now, dt);
+    else { S.talk.target = 0; speech.lift = 0; }
+    talkMix += ((roll ? 0.35 : 1) - talkMix) * ease(8, dt);
+
+    const T = { ...REST };
+    const staring = thinking.on && !speaking;
+    calm += ((staring ? 0.25 : 1) - calm) * ease(3, dt);
+    if (!roll) {
+      if (speaking) {
+        side.active = false;                      // eyes stay centered while talking
+        micro.x = micro.y = 0;
+      } else if (staring) {
+        // Thinking: a dead-still stare that narrows the longer the wait goes on
+        side.active = false;
+        micro.x = micro.y = 0;
+        const narrow = easeOutCubic(Math.min(1, (now - thinking.start) / 4500));
+        T.gy = 0.02;
+        T.lidL += 0.04 + 0.12 * narrow;
+        T.lidR += 0.04 + 0.12 * narrow;
+        T.tiltR += 3 * narrow;
+        // Long waits: a slow, bored glance away and back now and then
+        if (now >= thinking.nextGlance && now >= thinking.glanceUntil) {
+          thinking.dir = Math.random() < 0.5 ? -1 : 1;
+          thinking.glanceUntil = now + rand(1200, 1800);
+          thinking.nextGlance = thinking.glanceUntil + rand(4000, 6000);
+        }
+        if (now < thinking.glanceUntil) {
+          T.gx = thinking.dir * 0.7;
+          T.gy = -0.05;
+        }
+        if (now >= thinking.nextBlink) {
+          addBlink(STARE);
+          thinking.nextBlink = now + rand(3500, 5000);
+        }
+      } else {
+        // Side-eye every so often
+        if (SIDE_EYE_EVERY[1] > 0 && !side.active && now >= nextSideEye) {
+          side.active = true;
+          side.dir = Math.random() < 0.5 ? -1 : 1;
+          side.until = now + rand(1200, 2400);
+        }
+        if (side.active && now >= side.until) {
+          side.active = false;
+          nextSideEye = now + rand(...SIDE_EYE_EVERY);
+        }
+        if (side.active) {
+          T.gx = side.dir * 0.9;
+          T.gy = 0.05;
+          T.lidL += 0.07;
+          T.lidR += 0.07;
+        }
+        // Tiny resting eye movements so it never looks frozen
+        if (now >= micro.next) {
+          micro.x = rand(-0.05, 0.05);
+          micro.y = rand(-0.035, 0.035);
+          micro.next = now + rand(500, 1600);
+        }
+        T.gx += micro.x;
+        T.gy += micro.y;
+      }
+      if (!staring && now >= nextBlink) {
+        addBlink(LAZY);
+        if (Math.random() < 0.12) addBlink(LAZY, 420);
+        nextBlink = now + rand(...BLINK_EVERY);
+      }
+    }
+
+    if (roll) {
+      // The roll follows its curve exactly; springs pick up from wherever it leaves off
+      const el = now - roll.start;
+      if (!roll.blinked && el > 1150) { addBlink(UGH); roll.blinked = true; }
+      for (const k of FACE_KEYS) {
+        const v = sampleKeys(roll.keys, el, k);
+        S[k].vel = (v - S[k].value) / dt;
+        S[k].value = S[k].target = v;
+      }
+      if (el >= roll.keys[roll.keys.length - 1][0]) {
+        roll = null;
+        nextBlink = now + rand(2500, 5000);
+        nextSideEye = now + rand(3000, 7000);
+      }
+    } else {
+      for (const k of FACE_KEYS) S[k].target = T[k];
+    }
+
+    const steps = Math.max(1, Math.ceil(dt * 240));
+    for (let i = 0; i < steps; i++) {
+      stepSpring(S.talk, dt / steps);
+      if (!roll) for (const k of FACE_KEYS) stepSpring(S[k], dt / steps);
+    }
+    finishBlinks(now);
+
+    // A little stretch while the eyes are moving fast, eased so it never flickers
+    const stretchTarget = 1 + Math.min(1, Math.abs(S.talk.vel) / 40) * 0.05 * talkMix;
+    stretch += (stretchTarget - stretch) * ease(20, dt);
+
+    // ─── Render ───
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = CONFIG.background;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const face = [DPR * U, 0, 0, DPR * U, (W / 2) * DPR, (H / 2) * DPR];
+
+    // Motion blur: average several snapshots spread over the last few milliseconds.
+    // How many depends on how far things moved, so a still face costs a single draw.
+    const exposure = CONFIG.motionBlur / 1000;
+    const now0 = poseAgo(now, 0);
+    let samples = 1;
+    if (exposure > 0) {
+      const then = poseAgo(now, exposure);
+      const moved =
+        Math.abs(now0.gx - then.gx) * EYE.lookX + Math.abs(now0.gy - then.gy) * EYE.lookY + Math.abs(now0.y - then.y) +
+        (Math.abs(now0.lidL - then.lidL) + Math.abs(now0.lidR - then.lidR) + Math.abs(now0.sy - then.sy)) * EYE.h * 0.5 +
+        Math.abs(now0.blink - then.blink) * EYE.h * 0.4;
+      samples = clamp(Math.ceil((moved * U * DPR) / 0.75), 1, 16);
+    }
+
+    if (samples === 1) {
+      ctx.setTransform(...face);
+      ctx.fillStyle = CONFIG.eyeColor;
+      drawEyes(ctx, now0);
+    } else {
+      bctx.setTransform(1, 0, 0, 1, 0, 0);
+      bctx.clearRect(0, 0, blurLayer.width, blurLayer.height);
+      bctx.setTransform(...face);
+      bctx.fillStyle = CONFIG.eyeColor;
+      bctx.globalCompositeOperation = 'lighter';
+      bctx.globalAlpha = 1 / samples;
+      for (let i = 0; i < samples; i++) drawEyes(bctx, poseAgo(now, (exposure * (i + 0.5)) / samples));
+      bctx.globalCompositeOperation = 'source-over';
+      bctx.globalAlpha = 1;
+      ctx.drawImage(blurLayer, 0, 0);
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ─────────────────────────────── Controls ───────────────────────────────
+  function stopThinking() {
+    if (!thinking.on) return;
+    thinking.on = false;
+    nextBlink = performance.now() + rand(800, 2500);
+  }
+
+  const ANIMATIONS = {
+    unimpressed() { roll = null; speech.on = false; stopThinking(); },
+    thinking() {
+      if (thinking.on) return;
+      const now = performance.now();
+      speech.on = false;
+      side.active = false;
+      Object.assign(thinking, { on: true, start: now, nextBlink: now + 3200, nextGlance: now + 6000, glanceUntil: 0 });
+    },
+    speaking() {
+      stopThinking();
+      if (speech.on) return;
+      speech.on = true;
+      startPhrase();
+      speech.seg = null;
+    },
+    eyeRoll() { roll = buildRoll(performance.now()); side.active = false; },
+  };
+
+  function play(name, fromDemo = false) {
+    if (!fromDemo) stopDemo();
+    if (!ANIMATIONS[name]) {
+      console.warn(`[RoboFace] Unknown animation "${name}". Use: ${Object.keys(ANIMATIONS).join(', ')}`);
+      return;
+    }
+    ANIMATIONS[name]();
+  }
+
+  window.RoboFace = {
+    animations: Object.keys(ANIMATIONS),
+    play: (name) => play(name),
+    voice: (level) => { stopDemo(); stopThinking(); speech.ext = clamp(+level || 0, 0, 1); speech.extAt = performance.now(); },
+  };
+
+  window.addEventListener('message', (e) => {
+    const d = e.data;
+    const name = typeof d === 'string' ? d.trim() : d && (d.play || d.animation);
+    if (name) play(name);
+  });
+
+  // ─────────────────────────────── Preview demo ───────────────────────────
+  const DEMO = [
+    ['unimpressed', 3000],
+    ['thinking', 4000],
+    ['speaking', 4200],
+    ['eyeRoll', 2400],
+    ['thinking', 2200],
+    ['speaking', 3400],
+    ['unimpressed', 900],
+    ['eyeRoll', 2800],
+  ];
+  let demoTimer = null, demoStep = 0;
+  function demoLoop() {
+    const [name, ms] = DEMO[demoStep++ % DEMO.length];
+    if (name === 'eyeRoll') speech.on = false;
+    play(name, true);
+    demoTimer = setTimeout(demoLoop, ms);
+  }
+  function stopDemo() { clearTimeout(demoTimer); demoTimer = null; }
+
+  // ─────────────────────────────── Brain ──────────────────────────────────
+  // Switches on when customize.js has your PC's address (brainUrl). Without it, the demo plays.
+  // Tap the screen once to wake him up: browsers only allow the mic and voice after a tap.
+  const VOICE = { lang: pick('listenLanguage', 'en-US'), rate: pick('backupVoiceRate', 1.05), pitch: pick('backupVoicePitch', 0.85) };
+  const BRAIN_URL = String(pick('brainUrl', '')).trim().replace(/\/+$/, '');
+
+  // His personality comes from prompt.txt next to this page (lines starting with # are notes)
+  let PROMPT = '';
+  if (BRAIN_URL) {
+    fetch('prompt.txt', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.text() : ''))
+      .then((t) => { PROMPT = t.split('\n').filter((line) => !line.trim().startsWith('#')).join('\n').trim(); })
+      .catch(() => {});
+  }
+
+  function startBrain() {
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) {
+      console.warn('[RoboFace] This browser has no speech recognition. Use Chrome on Android or Safari on iPad.');
+      return;
+    }
+    const rec = new Recognition();
+    rec.lang = VOICE.lang;
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    let awake = false, busy = false, audioCtx = null;
+    const history = [];
+
+    // Passcode: open the site once with ?key=YOURCODE and this tablet remembers it
+    let passcode = '';
+    try {
+      const fromLink = new URLSearchParams(location.search).get('key');
+      if (fromLink) localStorage.setItem('robot-key', fromLink);
+      passcode = localStorage.getItem('robot-key') || '';
+    } catch {}
+
+    const listen = () => { if (awake && !busy) { try { rec.start(); } catch {} } };
+    rec.onresult = (e) => {
+      const text = e.results[0][0].transcript.trim();
+      if (text) respond(text);
+    };
+    rec.onend = () => setTimeout(listen, 250);       // keep listening
+    rec.onerror = (e) => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        awake = false;
+        console.warn('[RoboFace] Microphone blocked. See the setup steps for your tablet.');
+      }
+    };
+
+    async function respond(text) {
+      busy = true;
+      play('thinking');
+      let reply = '', audio = null;
+      try {
+        const r = await fetch(`${BRAIN_URL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-robot-key': passcode },
+          body: JSON.stringify({
+            text,
+            history,
+            prompt: PROMPT,
+            model: pick('aiModel', ''),
+            voiceId: pick('voiceId', ''),
+            voiceModel: pick('voiceModel', ''),
+          }),
+        });
+        if (r.status === 401) {
+          reply = "Who are you? Open me with the proper link.";
+        } else {
+          if (!r.ok) throw new Error(r.status);
+          const data = await r.json();
+          reply = data.reply || '';
+          audio = data.audio;
+          history.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
+          if (history.length > MEMORY * 2) history.splice(0, history.length - MEMORY * 2);
+        }
+      } catch {
+        reply = "Ugh. My brain isn't answering. Is the computer even on?";
+      }
+      const roll = /\[eye ?roll\]/i.test(reply);
+      reply = reply.replace(/\[eye ?roll\]/gi, '').replace(/\s+/g, ' ').trim();
+      let played = false;
+      if (audio && audioCtx) {
+        try { await playVoice(audio, roll); played = true; } catch (e) { console.warn('[RoboFace] Could not play ElevenLabs audio', e); }
+      }
+      if (!played) await say(reply, roll);
+      play('unimpressed');
+      busy = false;
+      listen();
+    }
+
+    // Plays the ElevenLabs voice and moves the eyes with how loud it actually is, syllable by syllable
+    async function playVoice(base64, roll) {
+      const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+      const buffer = await new Promise((ok, fail) => audioCtx.decodeAudioData(bytes.buffer, ok, fail));
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      return new Promise((resolve) => {
+        const source = audioCtx.createBufferSource();
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        source.buffer = buffer;
+        source.connect(analyser);
+        analyser.connect(audioCtx.destination);
+        const wave = new Uint8Array(analyser.fftSize);
+        let level = 0, playing = true;
+        const finish = () => { if (playing) { playing = false; resolve(); } };
+        const follow = () => {
+          if (!playing) return;
+          analyser.getByteTimeDomainData(wave);
+          let sum = 0;
+          for (let i = 0; i < wave.length; i++) { const v = (wave[i] - 128) / 128; sum += v * v; }
+          const loud = clamp((Math.sqrt(sum / wave.length) - 0.015) * 7, 0, 1);
+          level += (loud - level) * (loud > level ? 0.5 : 0.15);   // rise quickly, fall gently
+          speech.ext = level;
+          speech.extAt = performance.now();
+          requestAnimationFrame(follow);
+        };
+        source.onended = finish;
+        setTimeout(finish, buffer.duration * 1000 + 1500);   // safety net
+        stopThinking();
+        if (roll) play('eyeRoll');
+        source.start();
+        requestAnimationFrame(follow);
+      });
+    }
+
+    function say(text, roll) {
+      return new Promise((resolve) => {
+        if (!text) {
+          if (roll) play('eyeRoll');
+          setTimeout(resolve, roll ? 1900 : 0);
+          return;
+        }
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = VOICE.lang;
+        u.rate = VOICE.rate;
+        u.pitch = VOICE.pitch;
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        u.onstart = () => { play('speaking'); if (roll) play('eyeRoll'); };
+        u.onend = u.onerror = finish;
+        setTimeout(finish, 3000 + text.length * 90);  // safety net if the browser never reports the end
+        speechSynthesis.cancel();
+        speechSynthesis.speak(u);
+      });
+    }
+
+    // First tap wakes him up. Any later tap also nudges the mic back on if the tablet stopped it.
+    window.addEventListener('pointerdown', () => {
+      if (!awake) {
+        awake = true;
+        speechSynthesis.speak(new SpeechSynthesisUtterance(''));   // unlocks the backup voice on iPad
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) audioCtx = new AC();                                 // unlocks the ElevenLabs voice
+      }
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+      listen();
+    });
+  }
+
+  if (BRAIN_URL) startBrain();
+  else if (CONFIG.demo) demoTimer = setTimeout(demoLoop, 300);
+})();
+</script>
+</body>
+</html>
