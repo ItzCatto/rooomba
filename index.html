@@ -36,6 +36,14 @@
     -webkit-tap-highlight-color: transparent;
   }
   canvas { display: block; width: 100%; height: 100%; }
+  #debug {
+    position: fixed; left: 8px; top: 8px; right: 8px; max-height: 45vh; overflow: auto;
+    font: 12px/1.4 ui-monospace, monospace; color: #222; background: rgba(255,255,255,0.85);
+    border: 1px solid #999; border-radius: 6px; padding: 6px; cursor: auto; user-select: text; -webkit-user-select: text;
+  }
+  #debug form { display: flex; gap: 6px; margin-bottom: 6px; }
+  #debug input { flex: 1; font: inherit; padding: 6px; }
+  #debug button { font: inherit; padding: 6px 10px; }
   #status {
     position: fixed; left: 16px; right: 16px; bottom: 5vh;
     text-align: center; font: 600 clamp(14px, 2.6vmin, 22px)/1.35 system-ui, sans-serif;
@@ -602,6 +610,25 @@
     if (!statusHeld) status(text);
   }
 
+  // Debug mode: add &debug to the link to see every step on screen, plus a box to type instead of talk
+  const DEBUG = new URLSearchParams(location.search).has('debug');
+  let debugLog = null;
+  function log(msg) {
+    if (!DEBUG) return;
+    const line = document.createElement('div');
+    line.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+    debugLog.prepend(line);
+  }
+  if (DEBUG) {
+    const panel = document.createElement('div');
+    panel.id = 'debug';
+    panel.innerHTML = '<form><input placeholder="Type to test without the mic"><button>Send</button></form><div></div>';
+    document.body.append(panel);
+    debugLog = panel.lastChild;
+    panel.addEventListener('pointerdown', (e) => e.stopPropagation());   // typing here doesn't wake the mic
+    log(`page loaded. brainUrl = ${BRAIN_URL || '(empty)'}`);
+  }
+
   function startBrain() {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Recognition) {
@@ -609,6 +636,7 @@
       return;
     }
     status('Tap anywhere to wake me up');
+    log(`speech recognition: ${Recognition ? 'yes' : 'NO'}`);
     const rec = new Recognition();
     rec.lang = VOICE.lang;
     rec.interimResults = false;
@@ -631,6 +659,11 @@
       if (text) respond(text);
     };
     rec.onend = () => setTimeout(listen, 250);       // keep listening
+    for (const ev of ['start', 'audiostart', 'speechstart', 'speechend', 'nomatch', 'end']) {
+      rec.addEventListener(ev, () => log(`mic: ${ev}`));
+    }
+    rec.addEventListener('result', (e) => log(`mic heard: "${e.results[0][0].transcript}"`));
+    rec.addEventListener('error', (e) => log(`mic error: ${e.error}`));
     rec.onerror = (e) => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         awake = false;
@@ -650,6 +683,7 @@
       play('thinking');
       let reply = '', audio = null, problem = '';
       try {
+        log(`sending to PC (passcode ${passcode ? passcode.slice(0, 3) + '…' : 'MISSING'})`);
         const r = await fetch(`${BRAIN_URL}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-robot-key': passcode },
@@ -663,6 +697,7 @@
             voicePitch: pick('voicePitch', ''),
           }),
         });
+        log(`PC answered: ${r.status}`);
         if (r.status === 401) {
           reply = "Who are you? Open me with the proper link.";
           problem = 'Wrong passcode. Open the tablet link that server.py printed.';
@@ -673,11 +708,13 @@
           const data = await r.json();
           reply = data.reply || '';
           audio = data.audio;
+          log(`reply: "${reply}" / audio: ${audio ? Math.round(audio.length / 1365) + ' KB' : 'none'}`);
           if (!reply.replace(/\[eye ?roll\]/gi, '').trim()) problem = 'The AI gave an empty reply. Look at the server.py window.';
           history.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
           if (history.length > MEMORY * 2) history.splice(0, history.length - MEMORY * 2);
         }
-      } catch {
+      } catch (e) {
+        log(`could not reach PC: ${e.message}`);
         reply = "Ugh. My brain isn't answering. Is the computer even on?";
         problem = "Can't reach the PC. Is server.py running?";
       }
@@ -686,9 +723,9 @@
       status(problem || reply);                          // subtitles, or what went wrong
       let played = false;
       if (audio && audioCtx) {
-        try { await playVoice(audio, roll); played = true; } catch (e) { console.warn('[RoboFace] Could not play the voice audio', e); }
+        try { await playVoice(audio, roll); played = true; log('played PC voice'); } catch (e) { log(`PC voice failed: ${e.message || e}`); }
       }
-      if (!played) await say(reply, roll);
+      if (!played) { log(`using tablet voice${audioCtx ? '' : ' (screen not tapped yet)'}`); await say(reply, roll); }
       play('unimpressed');
       status(problem || reply, problem ? 8000 : 2500);
       busy = false;
@@ -753,6 +790,16 @@
     }
 
     // First tap wakes him up. Any later tap also nudges the mic back on if the tablet stopped it.
+    if (DEBUG) {
+      const form = document.querySelector('#debug form');
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const text = form.firstChild.value.trim();
+        form.firstChild.value = '';
+        if (text && !busy) { log(`typed: "${text}"`); respond(text); }
+      });
+    }
+
     window.addEventListener('pointerdown', () => {
       if (!awake) {
         awake = true;
