@@ -36,6 +36,7 @@ window.ROBOT_SETTINGS = {
   voice: 'en-AU-WilliamNeural',      // Free Microsoft voice. Others: en-GB-RyanNeural, en-US-GuyNeural, en-US-ChristopherNeural, en-AU-NatashaNeural
   voiceSpeed: '+5%',                  // Faster or slower, e.g. '-10%' or '+15%'
   voicePitch: '-4Hz',                 // Deeper or higher, e.g. '-10Hz' or '+5Hz'
+  useTabletVoice: false,              // true = skip the PC's voice and use the tablet's own (if the mic stops working after he talks)
   listenLanguage: 'en-US',            // Language he listens for, e.g. 'en-AU' or 'en-GB'
   backupVoiceRate: 1.05,              // The tablet's own voice, only used if the PC's voice fails
   backupVoicePitch: 0.85,
