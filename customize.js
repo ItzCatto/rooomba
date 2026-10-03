@@ -9,7 +9,7 @@
 window.ROBOT_SETTINGS = {
 
   // ── Brain (your PC) ──
-  brainUrl: '',             // Your PC's address from "tailscale funnel", e.g. 'https://robot.tail1234.ts.net'
+  brainUrl: 'https://cattos-mint-pc.tail008d0b.ts.net',        // Your PC's address from "tailscale funnel", e.g. 'https://robot.tail1234.ts.net'
   aiModel: '',              // Ollama model to use, e.g. 'llama3.2'. Empty = the PC's default
   memory: 10,               // How many back-and-forths he remembers in a conversation
 
